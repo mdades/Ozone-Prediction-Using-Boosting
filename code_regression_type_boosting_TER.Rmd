@@ -1,0 +1,469 @@
+---
+title: "code TER 4"
+output: html_document
+date: "2025-05-14"
+---
+
+
+
+```{r}
+
+# --- Chargement des packages nécessaires ---
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# --- Lecture et nettoyage des données ---
+df <- read_excel("atmo_polluants_Périgueux_V2.xlsx", na = c("", "NA", "NaN"))
+df <- df %>% select(-c(jour, PM2.5))
+df_clean <- df %>% drop_na()
+df_numeric <- df_clean %>% select(where(is.numeric))
+
+# --- Séparation train/test ---
+set.seed(456)
+train_indices <- sample(1:nrow(df_numeric), size = 0.8 * nrow(df_numeric))
+df_train <- df_numeric[train_indices, ]
+df_test  <- df_numeric[-train_indices, ]
+
+cat("Dimensions des données :\n")
+cat("- Entraînement :", dim(df_train)[1], "observations\n")
+cat("- Test         :", dim(df_test)[1], "observations\n")
+
+# --- Paramétrage du boosting ---
+n_iterations <- 12
+target_var <- "O3"
+df_boost <- df_train
+df_boost$error0 <- df_boost[[target_var]]
+
+# Initialisation
+selected_vars <- c()
+models <- list()
+rmse_train_list <- c()
+r2_train_list <- c()
+rmse_test_list <- c()
+r2_test_list <- c()
+
+
+# --- Boucle principale ---
+for (i in 1:n_iterations) {
+  
+  # Étape 1 : calcul des corrélations
+  corr_input <- df_boost %>% select(-starts_with("error"))
+  
+  # Exclure les variables déjà sélectionnées + la cible
+  candidate_vars <- setdiff(colnames(corr_input), c(selected_vars, target_var))
+  
+  if (length(candidate_vars) == 0) {
+    warning(sprintf("Plus aucune variable disponible à l'itération %d", i))
+    break
+  }
+  
+  correlations <- cor(df_boost[, candidate_vars], df_boost[[paste0("error", i - 1)]], use = "complete.obs")
+  correlations <- as.vector(correlations)
+  names(correlations) <- rownames(cor(df_boost[, candidate_vars]))
+  correlations <- correlations[!is.na(correlations)]
+  
+  if (length(correlations) == 0) {
+    stop(sprintf("Aucune variable corrélée trouvée à l'itération %d", i))
+  }
+  
+  # Étape 2 : sélection de la variable la plus corrélée
+  best_var <- names(which.max(abs(correlations)))
+  selected_vars <- c(selected_vars, best_var)
+  cat(sprintf("Itération %d - Variable sélectionnée : %s\n", i, best_var))
+  
+  # Étape 3 : apprentissage d’un modèle de l’erreur précédente
+  model_formula <- as.formula(paste0("error", i - 1, " ~ ", best_var))
+  model <- lm(model_formula, data = df_boost)
+  models[[i]] <- model
+  
+  # Étape 4 : mise à jour de l’erreur
+  df_boost[[paste0("error", i)]] <- df_boost[[paste0("error", i - 1)]] - predict(model, newdata = df_boost)
+  
+  # Étape 5 : modèle partiel avec toutes les variables sélectionnées jusqu’ici
+  partial_formula <- as.formula(paste("O3 ~", paste(selected_vars, collapse = " + ")))
+  partial_model <- lm(partial_formula, data = df_boost)
+  
+  # Étape 6 : prédictions
+  pred_train <- predict(partial_model, newdata = df_boost)
+  pred_test <- predict(partial_model, newdata = df_test)
+  
+  # Étape 7 : évaluation des performances
+  rmse_train <- sqrt(mean((df_boost$O3 - pred_train)^2))
+  r2_train <- 1 - sum((df_boost$O3 - pred_train)^2) / sum((df_boost$O3 - mean(df_boost$O3))^2)
+  
+  rmse_test <- sqrt(mean((df_test$O3 - pred_test)^2))
+  r2_test <- 1 - sum((df_test$O3 - pred_test)^2) / sum((df_test$O3 - mean(df_test$O3))^2)
+  
+  # Étape 8 : stockage
+  rmse_train_list <- c(rmse_train_list, rmse_train)
+  r2_train_list <- c(r2_train_list, r2_train)
+  rmse_test_list <- c(rmse_test_list, rmse_test)
+  r2_test_list <- c(r2_test_list, r2_test)
+}
+
+# --- Modèle final de prédiction avec toutes les variables sélectionnées ---
+final_formula <- as.formula(paste("O3 ~", paste(selected_vars, collapse = " + ")))
+final_model <- lm(final_formula, data = df_boost)
+
+# --- Prédictions finales ---
+predictions_train <- predict(final_model, newdata = df_boost)
+predictions_test <- predict(final_model, newdata = df_test)
+
+# --- Performances finales ---
+rmse_train_final <- sqrt(mean((df_boost$O3 - predictions_train)^2))
+r2_train_final <- 1 - sum((df_boost$O3 - predictions_train)^2) / sum((df_boost$O3 - mean(df_boost$O3))^2)
+
+rmse_test_final <- sqrt(mean((df_test$O3 - predictions_test)^2))
+r2_test_final <- 1 - sum((df_test$O3 - predictions_test)^2) / sum((df_test$O3 - mean(df_test$O3))^2)
+
+cat("\n--- Performances finales ---\n")
+cat("Entraînement : RMSE =", round(rmse_train_final, 4), ", R² =", round(r2_train_final, 4), "\n")
+cat("Test         : RMSE =", round(rmse_test_final, 4), ", R² =", round(r2_test_final, 4), "\n")
+
+# --- Tableau des performances à chaque itération ---
+df_perf <- data.frame(
+  Iteration = 1:length(rmse_train_list),
+  RMSE_Train = rmse_train_list,
+  R2_Train = r2_train_list,
+  RMSE_Test = rmse_test_list,
+  R2_Test = r2_test_list
+)
+
+# --- Graphique : évolution du RMSE ---
+ggplot(df_perf, aes(x = Iteration)) +
+  geom_line(aes(y = RMSE_Train, color = "Train"), size = 1.2) +
+  geom_line(aes(y = RMSE_Test, color = "Test"), linetype = "dashed", size = 1.2) +
+  geom_point(aes(y = RMSE_Train, color = "Train"), size = 2) +
+  geom_point(aes(y = RMSE_Test, color = "Test"), size = 2) +
+  labs(title = "Évolution du RMSE à chaque itération",
+       y = "RMSE",
+       x = "Itération",
+       color = "Jeu de données") +
+  theme_minimal()
+
+# --- Graphique : évolution du R² ---
+ggplot(df_perf, aes(x = Iteration)) +
+  geom_line(aes(y = R2_Train, color = "Train"), size = 1.2) +
+  geom_line(aes(y = R2_Test, color = "Test"), linetype = "dashed", size = 1.2) +
+  geom_point(aes(y = R2_Train, color = "Train"), size = 2) +
+  geom_point(aes(y = R2_Test, color = "Test"), size = 2) +
+  labs(title = "Évolution du R² à chaque itération",
+       y = "R²",
+       x = "Itération",
+       color = "Jeu de données") +
+  theme_minimal()
+
+# --- Visualisation : O3 prédit vs O3 réel (train) ---
+ggplot(df_boost, aes(x = O3, y = predictions_train)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Train : O3 réel vs prédit",
+       x = "O3 réel", y = "O3 prédit") +
+  theme_minimal()
+
+# --- Visualisation : O3 prédit vs O3 réel (test) ---
+ggplot(df_test, aes(x = O3, y = predictions_test)) +
+  geom_point(color = "darkgreen", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Test : O3 réel vs prédit",
+       x = "O3 réel", y = "O3 prédit") +
+  theme_minimal()
+
+# --- Fonction de prédiction personnalisée ---
+predict_o3 <- function(...) {
+  args <- list(...)
+  input_data <- as.data.frame(args, stringsAsFactors = FALSE)
+  
+  # Vérification des variables manquantes
+  missing <- setdiff(selected_vars, names(input_data))
+  if (length(missing) > 0) {
+    stop(paste("Variables manquantes :", paste(missing, collapse = ", ")))
+  }
+  
+  input_data <- input_data[, selected_vars, drop = FALSE]
+  return(predict(final_model, newdata = input_data))
+}
+
+
+
+# --- Post-traitement : suppression des prédictions négatives ---
+predictions_train_nonneg <- ifelse(predictions_train < 0, 0, predictions_train)
+predictions_test_nonneg  <- ifelse(predictions_test  < 0, 0, predictions_test)
+
+# --- Recalcul des RMSE après correction ---
+rmse_train_nonneg <- sqrt(mean((df_boost$O3 - predictions_train_nonneg)^2))
+rmse_test_nonneg  <- sqrt(mean((df_test$O3  - predictions_test_nonneg)^2))
+
+cat("\n--- Performances après correction des prédictions négatives ---\n")
+cat("Entraînement : RMSE corrigé =", round(rmse_train_nonneg, 4), "\n")
+cat("Test         : RMSE corrigé =", round(rmse_test_nonneg, 4), "\n")
+
+# --- Visualisation : O3 prédit vs O3 réel (train) avec correction ---
+ggplot(data.frame(O3 = df_boost$O3, Pred = predictions_train_nonneg), aes(x = O3, y = Pred)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Train : O3 réel vs prédit (valeurs négatives corrigées)",
+       x = "O3 réel", y = "O3 prédit (≥ 0)") +
+  theme_minimal()
+
+# --- Visualisation : O3 prédit vs O3 réel (test) avec correction ---
+ggplot(data.frame(O3 = df_test$O3, Pred = predictions_test_nonneg), aes(x = O3, y = Pred)) +
+  geom_point(color = "darkgreen", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Test : O3 réel vs prédit (valeurs négatives corrigées)",
+       x = "O3 réel", y = "O3 prédit (≥ 0)") +
+  theme_minimal()
+
+
+
+# --- Extraction des coefficients de chaque itération ---
+coef_table <- data.frame(
+  Iteration = integer(0),
+  Variable = character(0),
+  Intercept = numeric(0),
+  Coefficient = numeric(0),
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(models)) {
+  model_i <- models[[i]]
+  coef_i <- coef(model_i)
+  coef_table <- rbind(coef_table, data.frame(
+    Iteration = i,
+    Variable = selected_vars[i],
+    Intercept = coef_i[1],
+    Coefficient = coef_i[2]
+  ))
+}
+
+# Affichage du tableau
+print(coef_table)
+
+```
+
+```{r}
+
+# --- Création d'un sous-échantillon (625 lignes au total) ---
+set.seed(789)  # Pour reproductibilité
+
+# Tirage aléatoire sans remise
+sample_indices <- sample(1:nrow(df_numeric), size = 625, replace = FALSE)
+df_sampled <- df_numeric[sample_indices, ]
+
+# Répartition : 500 pour train, 125 pour test
+train_indices <- sample(1:625, size = 500, replace = FALSE)
+test_indices <- setdiff(1:625, train_indices)
+
+df_train <- df_sampled[train_indices, ]
+df_test  <- df_sampled[test_indices, ]
+
+cat("Sous-échantillon sélectionné :\n")
+cat("- Entraînement :", nrow(df_train), "lignes\n")
+cat("- Test         :", nrow(df_test), "lignes\n")
+
+
+# --- Paramétrage du boosting ---
+n_iterations <- 11
+target_var <- "O3"
+df_boost <- df_train
+df_boost$error0 <- df_boost[[target_var]]
+
+# Initialisation
+selected_vars <- c()
+models <- list()
+rmse_train_list <- c()
+r2_train_list <- c()
+rmse_test_list <- c()
+r2_test_list <- c()
+
+# Boucle principale
+for (i in 1:n_iterations) {
+  
+  # Sélection des variables candidates restantes
+  corr_input <- df_boost %>%
+    select(-starts_with("error"), -all_of(selected_vars))
+  
+  # Calcul des corrélations avec l'erreur précédente
+  correlations <- cor(corr_input, df_boost[[paste0("error", i - 1)]], use = "complete.obs")
+  correlations <- as.vector(correlations)
+  names(correlations) <- rownames(cor(corr_input))
+  correlations <- correlations[!is.na(correlations)]
+  correlations <- correlations[names(correlations) != target_var]
+
+  # Vérification qu’il reste des variables
+  if (length(correlations) == 0) {
+    warning(sprintf("Plus de variables disponibles à l’itération %d.", i))
+    break
+  }
+
+  # Sélection de la variable la plus corrélée
+  best_var <- names(which.max(abs(correlations)))
+  selected_vars <- c(selected_vars, best_var)
+  cat(sprintf("Itération %d - Variable sélectionnée : %s\n", i, best_var))
+
+  # Modèle de régression sur l’erreur précédente
+  model_formula <- as.formula(paste0("error", i - 1, " ~ ", best_var))
+  model <- lm(model_formula, data = df_boost)
+  models[[i]] <- model
+
+  # Mise à jour de l’erreur résiduelle
+  df_boost[[paste0("error", i)]] <- df_boost[[paste0("error", i - 1)]] - predict(model, newdata = df_boost)
+
+  # Modèle partiel avec toutes les variables sélectionnées jusqu'ici
+  partial_formula <- as.formula(paste("O3 ~", paste(selected_vars, collapse = " + ")))
+  partial_model <- lm(partial_formula, data = df_boost)
+
+  # Prédictions
+  pred_train <- predict(partial_model, newdata = df_boost)
+  pred_test <- predict(partial_model, newdata = df_test)
+
+  # Performance entraînement
+  rmse_train <- sqrt(mean((df_boost$O3 - pred_train)^2))
+  r2_train <- 1 - sum((df_boost$O3 - pred_train)^2) / sum((df_boost$O3 - mean(df_boost$O3))^2)
+
+  # Performance test
+  rmse_test <- sqrt(mean((df_test$O3 - pred_test)^2))
+  r2_test <- 1 - sum((df_test$O3 - pred_test)^2) / sum((df_test$O3 - mean(df_test$O3))^2)
+
+  # Stockage des performances
+  rmse_train_list <- c(rmse_train_list, rmse_train)
+  r2_train_list <- c(r2_train_list, r2_train)
+  rmse_test_list <- c(rmse_test_list, rmse_test)
+  r2_test_list <- c(r2_test_list, r2_test)
+}
+
+# --- Modèle final avec toutes les variables sélectionnées ---
+final_formula <- as.formula(paste("O3 ~", paste(selected_vars, collapse = " + ")))
+final_model <- lm(final_formula, data = df_boost)
+
+# --- Prédictions finales ---
+predictions_train <- predict(final_model, newdata = df_boost)
+predictions_test <- predict(final_model, newdata = df_test)
+
+# --- Performances finales ---
+rmse_train_final <- sqrt(mean((df_boost$O3 - predictions_train)^2))
+r2_train_final <- 1 - sum((df_boost$O3 - predictions_train)^2) / sum((df_boost$O3 - mean(df_boost$O3))^2)
+
+rmse_test_final <- sqrt(mean((df_test$O3 - predictions_test)^2))
+r2_test_final <- 1 - sum((df_test$O3 - predictions_test)^2) / sum((df_test$O3 - mean(df_test$O3))^2)
+
+cat("\n--- Performances finales ---\n")
+cat("Entraînement : RMSE =", round(rmse_train_final, 4), ", R² =", round(r2_train_final, 4), "\n")
+cat("Test         : RMSE =", round(rmse_test_final, 4), ", R² =", round(r2_test_final, 4), "\n")
+
+# --- Tableau de suivi des performances ---
+df_perf <- data.frame(
+  Iteration = 1:length(rmse_train_list),
+  RMSE_Train = rmse_train_list,
+  R2_Train = r2_train_list,
+  RMSE_Test = rmse_test_list,
+  R2_Test = r2_test_list
+)
+
+# --- Graphique : évolution du RMSE ---
+ggplot(df_perf, aes(x = Iteration)) +
+  geom_line(aes(y = RMSE_Train, color = "Train"), size = 1.2) +
+  geom_line(aes(y = RMSE_Test, color = "Test"), linetype = "dashed", size = 1.2) +
+  geom_point(aes(y = RMSE_Train, color = "Train"), size = 2) +
+  geom_point(aes(y = RMSE_Test, color = "Test"), size = 2) +
+  labs(title = "Évolution du RMSE à chaque itération",
+       y = "RMSE", x = "Itération", color = "Jeu de données") +
+  theme_minimal()
+
+# --- Graphique : évolution du R² ---
+ggplot(df_perf, aes(x = Iteration)) +
+  geom_line(aes(y = R2_Train, color = "Train"), size = 1.2) +
+  geom_line(aes(y = R2_Test, color = "Test"), linetype = "dashed", size = 1.2) +
+  geom_point(aes(y = R2_Train, color = "Train"), size = 2) +
+  geom_point(aes(y = R2_Test, color = "Test"), size = 2) +
+  labs(title = "Évolution du R² à chaque itération",
+       y = "R²", x = "Itération", color = "Jeu de données") +
+  theme_minimal()
+
+# --- Visualisation : O3 prédit vs O3 réel (train) ---
+ggplot(df_boost, aes(x = O3, y = predictions_train)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Train : O3 réel vs prédit",
+       x = "O3 réel", y = "O3 prédit") +
+  theme_minimal()
+
+# --- Visualisation : O3 prédit vs O3 réel (test) ---
+ggplot(df_test, aes(x = O3, y = predictions_test)) +
+  geom_point(color = "darkgreen", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Test : O3 réel vs prédit",
+       x = "O3 réel", y = "O3 prédit") +
+  theme_minimal()
+
+# --- Fonction de prédiction personnalisée ---
+predict_o3 <- function(...) {
+  args <- list(...)
+  input_data <- as.data.frame(args, stringsAsFactors = FALSE)
+
+  # Vérifie que toutes les variables nécessaires sont présentes
+  missing <- setdiff(selected_vars, names(input_data))
+  if (length(missing) > 0) {
+    stop(paste("Variables manquantes :", paste(missing, collapse = ", ")))
+  }
+
+  input_data <- input_data[, selected_vars, drop = FALSE]
+  return(predict(final_model, newdata = input_data))
+}
+
+# --- Post-traitement : suppression des prédictions négatives ---
+predictions_train_nonneg <- ifelse(predictions_train < 0, 0, predictions_train)
+predictions_test_nonneg  <- ifelse(predictions_test  < 0, 0, predictions_test)
+
+# --- Recalcul des RMSE après correction ---
+rmse_train_nonneg <- sqrt(mean((df_boost$O3 - predictions_train_nonneg)^2))
+rmse_test_nonneg  <- sqrt(mean((df_test$O3  - predictions_test_nonneg)^2))
+
+cat("\n--- Performances après correction des prédictions négatives ---\n")
+cat("Entraînement : RMSE corrigé =", round(rmse_train_nonneg, 4), "\n")
+cat("Test         : RMSE corrigé =", round(rmse_test_nonneg, 4), "\n")
+
+# --- Visualisation : O3 prédit vs O3 réel (train) avec correction ---
+ggplot(data.frame(O3 = df_boost$O3, Pred = predictions_train_nonneg), aes(x = O3, y = Pred)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Train : O3 réel vs prédit (valeurs négatives corrigées)",
+       x = "O3 réel", y = "O3 prédit (≥ 0)") +
+  theme_minimal()
+
+# --- Visualisation : O3 prédit vs O3 réel (test) avec correction ---
+ggplot(data.frame(O3 = df_test$O3, Pred = predictions_test_nonneg), aes(x = O3, y = Pred)) +
+  geom_point(color = "darkgreen", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Test : O3 réel vs prédit (valeurs négatives corrigées)",
+       x = "O3 réel", y = "O3 prédit (≥ 0)") +
+  theme_minimal()
+
+# --- Extraction des coefficients de chaque itération ---
+coef_table <- data.frame(
+  Iteration = integer(0),
+  Variable = character(0),
+  Intercept = numeric(0),
+  Coefficient = numeric(0),
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(models)) {
+  model_i <- models[[i]]
+  coef_i <- coef(model_i)
+  coef_table <- rbind(coef_table, data.frame(
+    Iteration = i,
+    Variable = selected_vars[i],
+    Intercept = coef_i[1],
+    Coefficient = coef_i[2]
+  ))
+}
+
+# Affichage du tableau
+print(coef_table)
+
+
+```
+

@@ -1,0 +1,615 @@
+---
+title: "Untitled"
+author: "Mathis"
+date: "2025-05-14"
+output: html_document
+---
+
+Jeux de données complet :
+```{r}
+# Charger les bibliothèques
+library(glmnet)
+library(caret)
+library(readxl)
+library(dplyr) 
+library(tidyr)
+library(corrplot)
+library(ggplot2)
+library(FactoMineR)
+library(factoextra)
+library(plotly)
+library(tibble)
+
+# Lire le fichier Excel
+df <- read_excel("atmo_polluants_Périgueux_V2.xlsx", na = c("", "NA", "NaN"))
+
+# Supprimer les colonnes non utiles sauf 'date_debut'
+df <- df %>% select(-c(jour, PM2.5))
+
+# Supprimer les lignes contenant au moins un NA
+df_clean <- df %>% drop_na()
+
+# Séparer aléatoirement en train (80%) et test (20%) tout en gardant 'date_debut'
+set.seed(456)  # Pour la reproductibilité
+train_index <- sample(1:nrow(df_clean), size = 0.8 * nrow(df_clean), replace = FALSE)
+
+df_train <- df_clean[train_index, ]
+df_test <- df_clean[-train_index, ]
+
+# Séparer la variable cible et les prédicteurs tout en gardant 'date_debut' pour le test
+
+y_train <- df_train$O3 # Extrais la variable cible O3 du jeu de donnée train. Cette variable va contenir les valeurs réelles de O3 sur lesquelles le modèle devra faire ses prédictions.
+
+X_train <- df_train %>% select(-c(O3, date_debut)) # Contient toutes les autres variables explicatives (les prédicteurs) pour l'entraînement, à l'exception de O3 (la cible) et date_debut (la date, qui ne sert pas dans le modèle).
+
+y_test <- df_test$O3 # même chose que pour y_train mais sur test 
+X_test <- df_test %>% select(-c(O3, date_debut)) # même chose que x_train mais sur test
+
+# Convertir en matrices pour glmnet
+X_train_matrix <- as.matrix(X_train)
+y_train_vector <- as.numeric(y_train)
+
+X_test_matrix <- as.matrix(X_test)
+y_test_vector <- as.numeric(y_test)
+
+
+# Appliquer la régression Lasso
+set.seed(456) # Cette ligne permet de fixer la graine aléatoire (seed) pour garantir que les résultats soient reproductibles.
+lasso_model <- glmnet(X_train_matrix, y_train_vector, alpha = 1)
+
+lasso_model$lambda |> head()
+
+plot(lasso_model,xvar="lambda",label=TRUE)
+
+# Validation croisée pour trouver le lambda optimal
+cv_lasso <- cv.glmnet(X_train_matrix, y_train_vector, alpha = 1)
+plot(cv_lasso)
+
+best_lambda <- cv_lasso$lambda.1se
+print(paste("Meilleur lambda :", best_lambda))
+# "Meilleur lambda : 0.6384"
+
+# Réentraîner le modèle avec le meilleur lambda
+lasso_final <- glmnet(X_train_matrix, y_train_vector, alpha = 1, lambda = best_lambda)
+
+# Obtenir les coefficients retenus
+coefficients <- coef(lasso_final)
+print(coefficients)
+
+# Faire la prédiction sur les données train
+y_train_pred <- predict(lasso_final, s = best_lambda, newx = X_train_matrix)
+
+# Calcul du RMSE sur train
+rmse <- sqrt(mean((y_train_vector - y_train_pred)^2))
+print(paste("RMSE du modèle sur les données train :", round(rmse, 3)))
+# "RMSE du modèle sur les données train : 15.873"
+
+# Création du tableau final avec 'date_debut', valeurs réelles et prédites
+df_train_results <- df_train %>%
+  mutate(O3_pred = as.vector(y_train_pred)) %>%
+  select(date_debut, O3, O3_pred)  # Inclure la date
+
+# Afficher un aperçu des résultats
+print(df_train_results)
+
+# Création du graphique : Prédictions vs Valeurs réelles
+ggplot(df_train_results, aes(x = O3, y = O3_pred)) +
+  geom_point(color = "darkgreen", alpha = 0.5) +  # Points en bleu avec transparence
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +  # Ligne y = x
+  labs(title = "Comparaison des valeurs réelles et prédites de O3
+                      sur les données train",
+       x = "Valeurs réelles de O3",
+       y = "Valeurs prédites de O3") +
+  theme_minimal()
+
+# Faire la prédiction sur les données test
+y_pred <- predict(lasso_final, s = best_lambda, newx = X_test_matrix)
+
+# Calcul du RMSE
+rmse <- sqrt(mean((y_test_vector - y_pred)^2))
+print(paste("RMSE du modèle sur les données test :", round(rmse, 3)))
+# "RMSE du modèle sur les données test : 16.268"
+
+# Création du tableau final avec 'date_debut', valeurs réelles et prédites
+df_test_results <- df_test %>%
+  mutate(O3_pred = as.vector(y_pred)) %>%
+  select(date_debut, O3, O3_pred)  # Inclure la date
+
+# Afficher un aperçu des résultats
+print(df_test_results)
+
+# Création du graphique : Prédictions vs Valeurs réelles
+ggplot(df_test_results, aes(x = O3, y = O3_pred)) +
+  geom_point(color = "blue", alpha = 0.5) +  # Points en bleu avec transparence
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +  # Ligne y = x
+  labs(title = "Comparaison des valeurs réelles et prédites de O3
+                      sur les données test",
+       x = "Valeurs réelles de O3",
+       y = "Valeurs prédites de O3") +
+  theme_minimal()
+```
+
+On remarque qu'on a des prédictions négatives, or ceci n'est pas possible dans le cas de la concentration en ozone alors on remplace les valeurs négatives par 0.
+```{r}
+# Faire la prédiction sur les données train
+y_train_pred <- predict(lasso_final, s = best_lambda, newx = X_train_matrix)
+y_train_pred <- pmax(y_train_pred, 0)  # Remplace les prédictions négatives par 0
+
+# Calcul du RMSE sur train
+rmse <- sqrt(mean((y_train_vector - y_train_pred)^2))
+print(paste("RMSE du modèle sur les données train :", round(rmse, 3)))
+# "RMSE du modèle sur les données train : 15.606"
+
+# Création du tableau final avec 'date_debut', valeurs réelles et prédites
+df_train_results <- df_train %>%
+  mutate(O3_pred = as.vector(y_train_pred)) %>%
+  select(date_debut, O3, O3_pred)  # Inclure la date
+
+# Afficher un aperçu des résultats
+print(df_train_results)
+
+# Création du graphique : Prédictions vs Valeurs réelles
+ggplot(df_train_results, aes(x = O3, y = O3_pred)) +
+  geom_point(color = "darkgreen", alpha = 0.5) +  # Points en bleu avec transparence
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +  # Ligne y = x
+  labs(title = "Comparaison des valeurs réelles et prédites de O3
+                      sur les données train",
+       x = "Valeurs réelles de O3",
+       y = "Valeurs prédites de O3") +
+  theme_minimal()
+
+# Faire la prédiction sur les données test
+y_pred <- predict(lasso_final, s = best_lambda, newx = X_test_matrix)
+y_pred <- pmax(y_pred, 0)  # Remplace les prédictions négatives par 0
+
+# Calcul du RMSE
+rmse <- sqrt(mean((y_test_vector - y_pred)^2))
+print(paste("RMSE du modèle sur les données test :", round(rmse, 3)))
+# "RMSE du modèle sur les données test : 15.877"
+
+# Création du tableau final avec 'date_debut', valeurs réelles et prédites
+df_test_results <- df_test %>%
+  mutate(O3_pred = as.vector(y_pred)) %>%
+  select(date_debut, O3, O3_pred)  # Inclure la date
+
+# Afficher un aperçu des résultats
+print(df_test_results)
+
+# Création du graphique : Prédictions vs Valeurs réelles
+ggplot(df_test_results, aes(x = O3, y = O3_pred)) +
+  geom_point(color = "blue", alpha = 0.5) +  # Points en bleu avec transparence
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +  # Ligne y = x
+  labs(title = "Comparaison des valeurs réelles et prédites de O3
+                      sur les données test",
+       x = "Valeurs réelles de O3",
+       y = "Valeurs prédites de O3") +
+  theme_minimal()
+```
+
+Suivre l'évolution des variables selon lambda
+```{r}
+# Extraire la matrice des coefficients
+coeffs_matrix <- as.matrix(lasso_model$beta)
+lambdas <- lasso_model$lambda
+
+# Initialiser une liste pour stocker les variables sélectionnées
+selected_variables <- list()
+
+# Pour chaque colonne (lambda), extraire les variables sélectionnées
+for (i in seq_along(lambdas)) {
+  non_zero_idx <- which(coeffs_matrix[, i] != 0)
+  vars <- rownames(coeffs_matrix)[non_zero_idx]
+  selected_variables[[i]] <- list(
+    lambda = lambdas[i],
+    n_vars = length(vars),
+    variables = vars
+  )
+}
+
+# Afficher les étapes où le nombre de variables augmente
+for (s in selected_variables) {
+  if (s$n_vars %in% c(1:10)) {  # par exemple, de 1 à 10 variables retenues
+    cat("Lambda:", round(s$lambda, 5), "\n")
+    cat("Nombre de variables:", s$n_vars, "\n")
+    cat("Variables sélectionnées:", paste(s$variables, collapse = ", "), "\n\n")
+  }
+}
+
+# Extraire la matrice des coefficients
+coeffs_matrix <- as.matrix(lasso_model$beta)
+lambdas <- lasso_model$lambda
+
+# Initialiser les vecteurs pour le graphique
+n_vars_selected <- integer(length(lambdas))
+lambda_vals <- lambdas
+variables_list <- character(length(lambdas))
+
+for (i in seq_along(lambdas)) {
+  non_zero_idx <- which(coeffs_matrix[, i] != 0)
+  vars <- rownames(coeffs_matrix)[non_zero_idx]
+  n_vars_selected[i] <- length(vars)
+  variables_list[i] <- paste(vars, collapse = ", ")
+}
+
+# Créer un data.frame
+df_lasso_summary <- data.frame(
+  lambda = lambda_vals,
+  n_variables = n_vars_selected,
+  variables = variables_list
+)
+
+# Créer le graphique interactif
+plot_ly(df_lasso_summary, x = ~log(lambda), y = ~n_variables, type = 'scatter', mode = 'lines+markers',
+        text = ~paste("Lambda:", round(lambda, 5), "<br>Variables:", variables),
+        hoverinfo = 'text') %>%
+  layout(title = "Nombre de variables sélectionnées vs log(Lambda)",
+         xaxis = list(title = "log(Lambda)"),
+         yaxis = list(title = "Nombre de variables sélectionnées"))
+
+# Créer un tableau résumé
+df_lasso_table <- data.frame(
+  lambda = lambda_vals,
+  log_lambda = log(lambda_vals),
+  n_variables = n_vars_selected,
+  variables = variables_list
+)
+
+# Trier par nombre de variables
+df_lasso_table_sorted <- df_lasso_table[order(df_lasso_table$n_variables), ]
+
+# Affichage dans un viewer interactif
+View(df_lasso_table_sorted)
+
+# Extraire les coefficients pour tous les lambda
+coef_matrix <- as.matrix(coef(lasso_model))
+
+# Compter combien de lambda ont chaque variable non nulle
+# (on exclut l'intercept, donc on commence à la 2e ligne)
+non_zero_counts <- apply(coef_matrix[-1, ], 1, function(x) sum(x != 0))
+
+# Ordre décroissant d'importance (plus tôt une variable est non nulle, plus elle est importante)
+variable_order <- names(sort(non_zero_counts, decreasing = TRUE))
+```
+
+Calcul des RMSE selon le nombre de variables sélectionnées (mais ici les RMSE sont calculés avec des prédictions qui peuvent être négatives) :
+```{r}
+# Initialiser les vecteurs
+lambda_seq_train <- lasso_model$lambda
+rmse_values_train <- c()
+nb_vars_kept_train <- c()
+
+# Pour chaque lambda, compter le nb de variables non nulles et calculer le RMSE
+for (i in seq_along(lambda_seq_train)) {
+  lambda_val_train <- lambda_seq_train[i]
+  coef_i_train <- coef(lasso_model, s = lambda_val_train)
+  nb_nonzero_train <- sum(coef_i_train[-1, ] != 0)  # Exclure intercept
+  
+  # Faire prédiction
+  y_pred_train <- predict(lasso_model, s = lambda_val_train, newx = X_train_matrix)
+  rmse_train <- sqrt(mean((y_train_vector - y_pred_train)^2))
+  
+  # Stocker les résultats
+  nb_vars_kept_train <- c(nb_vars_kept_train, nb_nonzero_train)
+  rmse_values_train <- c(rmse_values_train, rmse_train)
+}
+
+# Créer le tableau final
+df_rmse_vs_vars_train <- data.frame(
+  nb_variables_train = nb_vars_kept_train,
+  lambda_train = lambda_seq_train,
+  rmse_train = rmse_values_train
+) %>%
+  distinct(nb_variables_train, .keep_all = TRUE)  # Garde une ligne par nb de variables
+
+# Initialiser les vecteurs
+lambda_seq <- lasso_model$lambda
+rmse_values <- c()
+nb_vars_kept <- c()
+
+# Pour chaque lambda, compter le nb de variables non nulles et calculer le RMSE
+for (i in seq_along(lambda_seq)) {
+  lambda_val <- lambda_seq[i]
+  coef_i <- coef(lasso_model, s = lambda_val)
+  nb_nonzero <- sum(coef_i[-1, ] != 0)  # Exclure intercept
+  
+  # Faire prédiction
+  y_pred <- predict(lasso_model, s = lambda_val, newx = X_test_matrix)
+  rmse <- sqrt(mean((y_test_vector - y_pred)^2))
+  
+  # Stocker les résultats
+  nb_vars_kept <- c(nb_vars_kept, nb_nonzero)
+  rmse_values <- c(rmse_values, rmse)
+}
+
+# Créer le tableau final
+df_rmse_vs_vars <- data.frame(
+  nb_variables = nb_vars_kept,
+  lambda = lambda_seq,
+  rmse = rmse_values
+) %>%
+  distinct(nb_variables, .keep_all = TRUE)  # Garde une ligne par nb de variables
+
+# Ajouter une colonne pour identifier train/test
+df_test <- df_rmse_vs_vars %>%
+  rename(nb_variables = nb_variables, rmse = rmse) %>%
+  mutate(dataset = "Test")
+
+df_train <- df_rmse_vs_vars_train %>%
+  rename(nb_variables = nb_variables_train, rmse = rmse_train) %>%
+  mutate(dataset = "Train")
+
+# Fusionner les deux
+df_combined <- bind_rows(df_test, df_train)
+
+ggplot(df_combined, aes(x = nb_variables, y = rmse, color = dataset)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Évolution du RMSE selon le nombre de variables sélectionnées (Lasso)",
+    x = "Nombre de variables sélectionnées",
+    y = "RMSE",
+    color = "Données"
+  ) +
+  theme_minimal()
+```
+
+On fait la même chose sur un plus petit jeux de données
+```{r}
+# Lire le fichier Excel
+df <- read_excel("atmo_polluants_Périgueux_V2.xlsx", na = c("", "NA", "NaN"))
+
+# Supprimer les colonnes non utiles sauf 'date_debut'
+df <- df %>% select(-c(jour, PM2.5))
+
+# Supprimer les lignes contenant au moins un NA
+df_clean <- df %>% drop_na()
+
+set.seed(456)  # Pour la reproductibilité
+
+# Tirer aléatoirement 500 lignes pour le train
+train_index_sub <- sample(1:nrow(df_clean), size = 500, replace = FALSE)
+
+# Les indices restants
+remaining_index_sub <- setdiff(1:nrow(df_clean), train_index_sub)
+
+# Tirer aléatoirement 125 lignes pour le test à partir des lignes restantes
+test_index_sub <- sample(remaining_index_sub, size = 125, replace = FALSE)
+
+# Création des jeux d'entraînement et de test
+df_train_sub <- df_clean[train_index_sub, ]
+df_test_sub <- df_clean[test_index_sub, ]
+
+# Séparer les variables cibles et les prédicteurs
+y_train_sub <- df_train_sub$O3
+X_train_sub <- df_train_sub %>% select(-c(O3, date_debut))
+
+y_test_sub <- df_test_sub$O3
+X_test_sub <- df_test_sub %>% select(-c(O3, date_debut))
+
+# Convertir en matrices pour glmnet
+X_train_matrix_sub <- as.matrix(X_train_sub)
+y_train_vec_sub <- as.numeric(y_train_sub)
+
+X_test_matrix_sub <- as.matrix(X_test_sub)
+y_test_vec_sub <- as.numeric(y_test_sub)
+
+# Appliquer la régression Lasso
+set.seed(789)
+lasso_model_sub <- glmnet(X_train_matrix_sub, y_train_vec_sub, alpha = 1)
+
+lasso_model_sub$lambda |> head()
+
+plot(lasso_model_sub, xvar = "lambda", label = TRUE)
+
+# Validation croisée pour trouver le lambda optimal
+cv_lasso_sub <- cv.glmnet(X_train_matrix_sub, y_train_vec_sub, alpha = 1)
+plot(cv_lasso_sub)
+
+best_lambda_sub <- cv_lasso_sub$lambda.1se
+print(paste("Meilleur lambda :", best_lambda_sub))
+# "Meilleur lambda : 1.77"
+
+# Réentraîner le modèle avec le meilleur lambda
+lasso_final_sub <- glmnet(X_train_matrix_sub, y_train_vec_sub, alpha = 1, lambda = best_lambda_sub)
+
+# Obtenir les coefficients retenus
+coefficients_sub <- coef(lasso_final_sub)
+print(coefficients_sub)
+
+# Faire la prédiction sur les données train
+y_train_pred_sub <- predict(lasso_final_sub, s = best_lambda_sub, newx = X_train_matrix_sub)
+
+# Calcul du RMSE sur train
+rmse_sub_train <- sqrt(mean((y_train_vec_sub - y_train_pred_sub)^2))
+print(paste("RMSE du modèle sur train :", round(rmse_sub_train, 3)))
+# "RMSE du modèle sur train : 16.495"
+
+# Création du tableau final avec 'date_debut', valeurs réelles et prédites
+df_train_results_sub <- df_train_sub %>%
+  mutate(O3_pred = as.vector(y_train_pred_sub)) %>%
+  select(date_debut, O3, O3_pred)
+
+print(df_train_results_sub)
+
+# Graphique : Prédictions vs Valeurs réelles (train)
+ggplot(df_train_results_sub, aes(x = O3, y = O3_pred)) +
+  geom_point(color = "darkgreen", alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Comparaison des valeurs réelles et prédites de O3 (train)",
+       x = "Valeurs réelles de O3",
+       y = "Valeurs prédites de O3") +
+  theme_minimal()
+
+# Faire la prédiction sur les données test
+y_pred_sub <- predict(lasso_final_sub, s = best_lambda_sub, newx = X_test_matrix_sub)
+
+# Calcul du RMSE
+rmse_sub_test <- sqrt(mean((y_test_vec_sub - y_pred_sub)^2))
+print(paste("RMSE du modèle sur test :", round(rmse_sub_test, 3)))
+#"RMSE du modèle sur test : 18.584"
+
+# Création du tableau final avec 'date_debut', valeurs réelles et prédites
+df_test_results_sub <- df_test_sub %>%
+  mutate(O3_pred = as.vector(y_pred_sub)) %>%
+  select(date_debut, O3, O3_pred)
+
+print(df_test_results_sub)
+
+# Graphique : Prédictions vs Valeurs réelles (test)
+ggplot(df_test_results_sub, aes(x = O3, y = O3_pred)) +
+  geom_point(color = "blue", alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Comparaison des valeurs réelles et prédites de O3 (test)",
+       x = "Valeurs réelles de O3",
+       y = "Valeurs prédites de O3") +
+  theme_minimal()
+
+```
+
+On remarque qu'on a des prédictions négatives, or ceci n'est pas possible dans le cas de la concentration en ozone alors on remplace les valeurs négatives par 0.
+```{r}
+# Faire la prédiction sur les données train
+y_train_pred_sub <- predict(lasso_final_sub, s = best_lambda_sub, newx = X_train_matrix_sub)
+y_train_pred_sub <- pmax(y_train_pred_sub, 0)  # Remplace les prédictions négatives par 0
+
+# Calcul du RMSE sur train
+rmse_sub_train <- sqrt(mean((y_train_vec_sub - y_train_pred_sub)^2))
+print(paste("RMSE du modèle sur les données train :", round(rmse_sub_train, 3)))
+# "RMSE du modèle sur les données train : 16.242"
+
+# Création du tableau final avec 'date_debut', valeurs réelles et prédites
+df_train_results_sub <- df_train_sub %>%
+  mutate(O3_pred = as.vector(y_train_pred_sub)) %>%
+  select(date_debut, O3, O3_pred)
+
+# Afficher un aperçu des résultats
+print(df_train_results_sub)
+
+# Création du graphique : Prédictions vs Valeurs réelles
+ggplot(df_train_results_sub, aes(x = O3, y = O3_pred)) +
+  geom_point(color = "darkgreen", alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Comparaison des valeurs réelles et prédites de O3 sur les données train",
+       x = "Valeurs réelles de O3",
+       y = "Valeurs prédites de O3") +
+  theme_minimal()
+
+# Faire la prédiction sur les données test
+y_pred_sub <- predict(lasso_final_sub, s = best_lambda_sub, newx = X_test_matrix_sub)
+y_pred_sub <- pmax(y_pred_sub, 0)  # Remplace les prédictions négatives par 0
+
+# Calcul du RMSE sur test
+rmse_sub_test <- sqrt(mean((y_test_vec_sub - y_pred_sub)^2))
+print(paste("RMSE du modèle sur les données test :", round(rmse_sub_test, 3)))
+# "RMSE du modèle sur les données test : 16.225"
+
+# Création du tableau final avec 'date_debut', valeurs réelles et prédites
+df_test_results_sub <- df_test_sub %>%
+  mutate(O3_pred = as.vector(y_pred_sub)) %>%
+  select(date_debut, O3, O3_pred)
+
+# Afficher un aperçu des résultats
+print(df_test_results_sub)
+
+# Création du graphique : Prédictions vs Valeurs réelles
+ggplot(df_test_results_sub, aes(x = O3, y = O3_pred)) +
+  geom_point(color = "blue", alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Comparaison des valeurs réelles et prédites de O3 sur les données test",
+       x = "Valeurs réelles de O3",
+       y = "Valeurs prédites de O3") +
+  theme_minimal()
+
+```
+
+
+
+Calcul des RMSE selon le nombre de variables sélectionnées sur le sous-échantillon (mais ici les RMSE sont calculés avec des prédictions qui peuvent être négatives) :
+```{r}
+# Initialiser les vecteurs pour le jeu de données train (500 lignes)
+lambda_seq_train_sub <- lasso_model_sub$lambda
+rmse_values_train_sub <- c()
+nb_vars_kept_train_sub <- c()
+
+# Pour chaque lambda, compter le nb de variables non nulles et calculer le RMSE pour train
+for (i in seq_along(lambda_seq_train_sub)) {
+  lambda_val_train_sub <- lambda_seq_train_sub[i]
+  coef_i_train_sub <- coef(lasso_model_sub, s = lambda_val_train_sub)
+  nb_nonzero_train_sub <- sum(coef_i_train_sub[-1, ] != 0)  # Exclure intercept
+  
+  # Faire prédiction sur le train
+  y_pred_train_sub <- predict(lasso_model_sub, s = lambda_val_train_sub, newx = X_train_matrix_sub)
+  rmse_train_sub <- sqrt(mean((y_train_vec_sub - y_pred_train_sub)^2))
+  
+  # Stocker les résultats
+  nb_vars_kept_train_sub <- c(nb_vars_kept_train_sub, nb_nonzero_train_sub)
+  rmse_values_train_sub <- c(rmse_values_train_sub, rmse_train_sub)
+}
+
+# Créer le tableau final pour le train
+df_rmse_vs_vars_train_sub <- data.frame(
+  nb_variables_train_sub = nb_vars_kept_train_sub,
+  lambda_train_sub = lambda_seq_train_sub,
+  rmse_train_sub = rmse_values_train_sub
+) %>%
+  distinct(nb_variables_train_sub, .keep_all = TRUE)  # Garde une ligne par nb de variables
+
+# Initialiser les vecteurs pour le jeu de données test (125 lignes)
+lambda_seq_test_sub <- lasso_model_sub$lambda
+rmse_values_test_sub <- c()
+nb_vars_kept_test_sub <- c()
+
+# Pour chaque lambda, compter le nb de variables non nulles et calculer le RMSE pour test
+for (i in seq_along(lambda_seq_test_sub)) {
+  lambda_val_test_sub <- lambda_seq_test_sub[i]
+  coef_i_test_sub <- coef(lasso_model_sub, s = lambda_val_test_sub)
+  nb_nonzero_test_sub <- sum(coef_i_test_sub[-1, ] != 0)  # Exclure intercept
+  
+  # Faire prédiction sur le test
+  y_pred_test_sub <- predict(lasso_model_sub, s = lambda_val_test_sub, newx = X_test_matrix_sub)
+  rmse_test_sub <- sqrt(mean((y_test_vec_sub - y_pred_test_sub)^2))
+  
+  # Stocker les résultats
+  nb_vars_kept_test_sub <- c(nb_vars_kept_test_sub, nb_nonzero_test_sub)
+  rmse_values_test_sub <- c(rmse_values_test_sub, rmse_test_sub)
+}
+
+# Créer le tableau final pour le test
+df_rmse_vs_vars_test_sub <- data.frame(
+  nb_variables_test_sub = nb_vars_kept_test_sub,
+  lambda_test_sub = lambda_seq_test_sub,
+  rmse_test_sub = rmse_values_test_sub
+) %>%
+  distinct(nb_variables_test_sub, .keep_all = TRUE)  # Garde une ligne par nb de variables
+
+# Ajouter une colonne pour identifier train/test
+df_train_sub <- df_rmse_vs_vars_train_sub %>%
+  rename(nb_variables = nb_variables_train_sub, rmse = rmse_train_sub) %>%
+  mutate(dataset = "Train")
+
+df_test_sub <- df_rmse_vs_vars_test_sub %>%
+  rename(nb_variables = nb_variables_test_sub, rmse = rmse_test_sub) %>%
+  mutate(dataset = "Test")
+
+# Fusionner les deux
+df_combined_sub <- bind_rows(df_test_sub, df_train_sub)
+
+# Création du graphique : Évolution du RMSE selon le nombre de variables sélectionnées
+ggplot(df_combined_sub, aes(x = nb_variables, y = rmse, color = dataset)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Évolution du RMSE sur un plus faible jeux de données selon le nombre de variables sélectionnées (Lasso)",
+    x = "Nombre de variables sélectionnées",
+    y = "RMSE",
+    color = "Données"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+
+
+
